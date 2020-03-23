@@ -16,11 +16,6 @@
 
 package org.springframework.kafka.core;
 
-import java.time.Duration;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
 import org.apache.commons.logging.LogFactory;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.Callback;
@@ -30,7 +25,6 @@ import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
-
 import org.springframework.beans.factory.BeanNameAware;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.context.ApplicationContext;
@@ -53,13 +47,16 @@ import org.springframework.util.Assert;
 import org.springframework.util.concurrent.ListenableFuture;
 import org.springframework.util.concurrent.SettableListenableFuture;
 
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 
 /**
- * A template for executing high-level operations.
- *
+ * 用于执行底层操作的模板类
  * @param <K> the key type.
  * @param <V> the value type.
- *
  * @author Marius Bogoevici
  * @author Gary Russell
  * @author Igor Stepanov
@@ -73,21 +70,31 @@ public class KafkaTemplate<K, V> implements KafkaOperations<K, V>, ApplicationCo
 	protected final LogAccessor logger = new LogAccessor(LogFactory.getLog(this.getClass())); //NOSONAR
 
 	private final ProducerFactory<K, V> producerFactory;
-
+	/**
+	 * 是否开启自动刷新
+	 */
 	private final boolean autoFlush;
-
+	/**
+	 * 是否开启事务
+	 */
 	private final boolean transactional;
 
 	private final ThreadLocal<Producer<K, V>> producers = new ThreadLocal<>();
 
 	private final Map<String, String> micrometerTags = new HashMap<>();
-
+	/**
+	 * bean名称
+	 */
 	private String beanName = "kafkaTemplate";
 
 	private ApplicationContext applicationContext;
-
+	/**
+	 * record消息转换器
+	 */
 	private RecordMessageConverter messageConverter = new MessagingMessageConverter();
-
+	/**
+	 * 默认发送的topic，默认false
+	 */
 	private String defaultTopic;
 
 	private ProducerListener<K, V> producerListener = new LoggingProducerListener<K, V>();
@@ -95,9 +102,13 @@ public class KafkaTemplate<K, V> implements KafkaOperations<K, V>, ApplicationCo
 	private String transactionIdPrefix;
 
 	private Duration closeTimeout = ProducerFactoryUtils.DEFAULT_CLOSE_TIMEOUT;
-
+	/**
+	 * 允许开启非事务型的producer
+	 */
 	private boolean allowNonTransactional;
-
+	/**
+	 * 是否开启Listener的计时器
+	 */
 	private volatile boolean micrometerEnabled = true;
 
 	private volatile MicrometerHolder micrometerHolder;
@@ -413,11 +424,13 @@ public class KafkaTemplate<K, V> implements KafkaOperations<K, V>, ApplicationCo
 	 */
 	@Override
 	public void flush() {
+		// 获取producer实例
 		Producer<K, V> producer = getTheProducer();
 		try {
+			// 尝试清空record所在的缓冲区
 			producer.flush();
-		}
-		finally {
+		} finally {
+			// 关闭producer，无论是否处于事务状态
 			closeProducer(producer, inTransaction());
 		}
 	}
@@ -448,23 +461,26 @@ public class KafkaTemplate<K, V> implements KafkaOperations<K, V>, ApplicationCo
 	}
 
 	/**
-	 * Send the producer record.
-	 * @param producerRecord the producer record.
-	 * @return a Future for the {@link org.apache.kafka.clients.producer.RecordMetadata
-	 * RecordMetadata}.
+	 * 发送组装好的ProducerRecord
+	 * @param producerRecord 带有应用需要送的消息及信息的record
+	 * @return 存储 {@link org.apache.kafka.clients.producer.RecordMetadata RecordMetadata}的ListenableFuture对象
 	 */
 	protected ListenableFuture<SendResult<K, V>> doSend(final ProducerRecord<K, V> producerRecord) {
+		// 获取对应类型的producer实例
 		final Producer<K, V> producer = getTheProducer();
 		this.logger.trace(() -> "Sending: " + producerRecord);
 		final SettableListenableFuture<SendResult<K, V>> future = new SettableListenableFuture<>();
 		Object sample = null;
+		// 开启listener的计时器
 		if (this.micrometerEnabled && this.micrometerHolder == null) {
 			this.micrometerHolder = obtainMicrometerHolder();
 		}
 		if (this.micrometerHolder != null) {
 			sample = this.micrometerHolder.start();
 		}
+		// 使用producer发送消息，并构造回调方法
 		producer.send(producerRecord, buildCallback(producerRecord, producer, future, sample));
+		// 如果开启了autoflush，则执行flush操作
 		if (this.autoFlush) {
 			flush();
 		}
@@ -474,24 +490,30 @@ public class KafkaTemplate<K, V> implements KafkaOperations<K, V>, ApplicationCo
 
 	private Callback buildCallback(final ProducerRecord<K, V> producerRecord, final Producer<K, V> producer,
 			final SettableListenableFuture<SendResult<K, V>> future, Object sample) {
-
+		// 对record发送响应进行校验
 		return (metadata, exception) -> {
 			try {
 				if (exception == null) {
+					// exception为null，证明record发送成功
+					// 开启计时器的情况下，记录请求成功时间
 					if (sample != null) {
 						this.micrometerHolder.success(sample);
 					}
+					// 向Spring包装的future对象中添加发送成功响应对象
 					future.set(new SendResult<>(producerRecord, metadata));
+					// 如果实现了producerListener，还会触发listener的监听
 					if (KafkaTemplate.this.producerListener != null) {
 						KafkaTemplate.this.producerListener.onSuccess(producerRecord, metadata);
 					}
 					KafkaTemplate.this.logger.trace(() -> "Sent ok: " + producerRecord + ", metadata: " + metadata);
-				}
-				else {
+				} else {
+					// 此时在发送record过程中出现了异常
 					if (sample != null) {
 						this.micrometerHolder.failure(sample, exception.getClass().getSimpleName());
 					}
+					// 则在Spring包装的future对象中设置异常信息
 					future.setException(new KafkaProducerException(producerRecord, "Failed to send", exception));
+					// 触发listener的失败操作
 					if (KafkaTemplate.this.producerListener != null) {
 						KafkaTemplate.this.producerListener.onError(producerRecord, exception);
 					}
@@ -499,6 +521,7 @@ public class KafkaTemplate<K, V> implements KafkaOperations<K, V>, ApplicationCo
 				}
 			}
 			finally {
+				// 如果未开启事务，则需要关闭producer实例
 				if (!KafkaTemplate.this.transactional) {
 					closeProducer(producer, false);
 				}
@@ -508,45 +531,59 @@ public class KafkaTemplate<K, V> implements KafkaOperations<K, V>, ApplicationCo
 
 
 	/**
-	 * Return true if the template is currently running in a transaction on the calling
-	 * thread.
-	 * @return true if a transaction is running.
+	 * 当前调用线程已经运行与事务中
+	 * @return 运行于事务中，返回true
 	 * @since 2.2.1
 	 */
 	@Override
 	public boolean inTransaction() {
+		// 当前已经配置开启事务
+		// 并且可以可以从调用线程的ThreadLocal中获取producer实例，或者已有实例化的producer工厂，或者事务管理器已经确认事务处于活跃状态
 		return this.transactional && (this.producers.get() != null
 				|| TransactionSynchronizationManager.getResource(this.producerFactory) != null
 				|| TransactionSynchronizationManager.isActualTransactionActive());
 	}
 
+	/**
+	 * @return 对应类型的producer实例
+	 */
 	private Producer<K, V> getTheProducer() {
+		// 是否已经配置开启producer的事务性
 		boolean transactionalProducer = this.transactional;
 		if (transactionalProducer) {
+			// 如果已经配置开启prodcuer的事务性，则判断当前场景下，是否已经进入事务
 			boolean inTransaction = inTransaction();
+			// 校验事务的状态，如果不允许非事务性的生产过长，并且当前调用线程没有处于事务中
+			// 进行提醒，建议使用KafkaTemplate#executeInTransaction()或@Transactinal注解
 			Assert.state(this.allowNonTransactional || inTransaction,
 					"No transaction is in process; "
-						+ "possible solutions: run the template operation within the scope of a "
-						+ "template.executeInTransaction() operation, start a transaction with @Transactional "
-						+ "before invoking the template method, "
-						+ "run in a transaction started by a listener container when consuming a record");
+							+ "possible solutions: run the template operation within the scope of a "
+							+ "template.executeInTransaction() operation, start a transaction with @Transactional "
+							+ "before invoking the template method, "
+							+ "run in a transaction started by a listener container when consuming a record");
+			// 如果允许非事务的生产过程，并且当前调用线程也不处于事务中，则可以不使用事务producer
 			if (!inTransaction) {
 				transactionalProducer = false;
 			}
 		}
+		// 在当前调用线程处于事务中时，需要使用事务型producer
 		if (transactionalProducer) {
+			// 如果已经存在producer实例，直接从KafkaTemplate的ThreadLocal中获取producer实例即可
 			Producer<K, V> producer = this.producers.get();
 			if (producer != null) {
 				return producer;
 			}
+			// 如果事务是刚刚开启，还没有创建producer实例，则使用producerFactory工厂，配置的transactinId和事务默认等待时间创建新的producer实例
 			KafkaResourceHolder<K, V> holder = ProducerFactoryUtils
 					.getTransactionalResourceHolder(this.producerFactory, this.transactionIdPrefix, this.closeTimeout);
 			return holder.getProducer();
 		}
+		// 接下来的两种情况，均由DefaultKafkaProducerFactory提供实现
+		// 如果允许非事务型的producer，则创建非实物型producer实例
 		else if (this.allowNonTransactional) {
 			return this.producerFactory.createNonTransactionalProducer();
-		}
-		else {
+		} else {
+			// 根据实际情况创建producer实例
 			return this.producerFactory.createProducer();
 		}
 	}

@@ -16,21 +16,6 @@
 
 package org.springframework.kafka.core;
 
-import java.time.Duration;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
-import java.util.function.Supplier;
-
 import org.apache.commons.logging.LogFactory;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.Callback;
@@ -46,7 +31,6 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.serialization.Serializer;
-
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.context.ApplicationContext;
@@ -58,6 +42,21 @@ import org.springframework.kafka.support.TransactionSupport;
 import org.springframework.lang.Nullable;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
+
+import java.time.Duration;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The {@link ProducerFactory} implementation for a {@code singleton} shared {@link Producer} instance.
@@ -133,7 +132,9 @@ public class DefaultKafkaProducerFactory<K, V> implements ProducerFactory<K, V>,
 	private String transactionIdPrefix;
 
 	private ApplicationContext applicationContext;
-
+	/**
+	 *
+	 */
 	private boolean producerPerConsumerPartition = true;
 
 	private boolean producerPerThread;
@@ -365,29 +366,41 @@ public class DefaultKafkaProducerFactory<K, V> implements ProducerFactory<K, V>,
 
 	@Override
 	public Producer<K, V> createNonTransactionalProducer() {
+		// 创建非事务型producer实例则不需要事务ID前缀
 		return doCreateProducer(null);
 	}
 
 	private Producer<K, V> doCreateProducer(@Nullable String txIdPrefix) {
+		// 如果存在事务ID前缀
 		if (txIdPrefix != null) {
+			// 如果需要避免僵尸实例问题，则可以在ProducerFactory中开启producerPerConsumerPartition配置
+			// 僵尸实例问题：某个producer实例临时失联，新的producer会代替失联的实例，而失联的producer恢复后，就会出现两条同样的消息
 			if (this.producerPerConsumerPartition) {
 				return createTransactionalProducerForPartition(txIdPrefix);
-			}
-			else {
+			} else {
+				// 如果开发者可以自己处理重复调用问题，则直接创建事务型producer实例
 				return createTransactionalProducer(txIdPrefix);
 			}
 		}
+		// 如果需要为每个线程创建producer
+		// 为什么需要为每个线程创建producer
+		// 多个线程调用同一个producer实例时，一个线程进行flush()操作，会阻塞其他的线程
 		if (this.producerPerThread) {
 			CloseSafeProducer<K, V> tlProducer = this.threadBoundProducers.get();
+			// 则为每个线程单独创建producer
 			if (tlProducer == null) {
 				tlProducer = new CloseSafeProducer<>(createKafkaProducer());
 				this.threadBoundProducers.set(tlProducer);
 			}
 			return tlProducer;
 		}
+		// 此种情况默认为我们经常使用的producer实例
+		// 即进程内的线程共用同一个producer
 		if (this.producer == null) {
 			synchronized (this) {
+				// 需要双重校验所保证线程安全
 				if (this.producer == null) {
+					// 创建producer实例
 					this.producer = new CloseSafeProducer<>(createKafkaProducer());
 				}
 			}
@@ -396,15 +409,16 @@ public class DefaultKafkaProducerFactory<K, V> implements ProducerFactory<K, V>,
 	}
 
 	/**
-	 * Subclasses must return a raw producer which will be wrapped in a {@link CloseSafeProducer}.
-	 * @return the producer.
+	 * 子类的实现需要将原生KafkaProducer包装为{@link CloseSafeProducer}
+	 * @return producer实例
 	 */
 	protected Producer<K, V> createKafkaProducer() {
+		// 判断是否指定了client.id配置，并以自定义的client.id或者默认的client.id创建producer实例
 		if (this.clientIdPrefix == null) {
 			return createRawProducer(this.configs);
-		}
-		else {
+		} else {
 			Map<String, Object> newConfigs = new HashMap<>(this.configs);
+			// 如果指定了client.id前缀配置，则producer实例名称将会按照递增的顺序依次增加
 			newConfigs.put(ProducerConfig.CLIENT_ID_CONFIG,
 					this.clientIdPrefix + "-" + this.clientIdCounter.incrementAndGet());
 			return createRawProducer(newConfigs);
@@ -416,19 +430,22 @@ public class DefaultKafkaProducerFactory<K, V> implements ProducerFactory<K, V>,
 	}
 
 	protected Producer<K, V> createTransactionalProducerForPartition(String txIdPrefix) {
+		// 获取事务ID的尾缀
 		String suffix = TransactionSupport.getTransactionIdSuffix();
 		if (suffix == null) {
+			// 不存在事务ID尾缀的情况下，直接使用事务ID创建producer实例
 			return createTransactionalProducer(txIdPrefix);
-		}
-		else {
+		} else {
+			// 存在事务ID尾缀的情况下，则需要对已创建的producer实例缓存进行加锁
 			synchronized (this.consumerProducers) {
+				// 没有给定尾缀的producer实例，需要根据事务ID前缀和尾缀分别创建一个producer实例，并放入producer实例缓存中
 				if (!this.consumerProducers.containsKey(suffix)) {
 					CloseSafeProducer<K, V> newProducer = doCreateTxProducer(txIdPrefix, suffix,
 							this::removeConsumerProducer);
 					this.consumerProducers.put(suffix, newProducer);
 					return newProducer;
-				}
-				else {
+				} else {
+					// 如果已经创建事务ID尾缀的producer实例，则直接返回此实例
 					return this.consumerProducers.get(suffix);
 				}
 			}
@@ -460,32 +477,42 @@ public class DefaultKafkaProducerFactory<K, V> implements ProducerFactory<K, V>,
 	protected Producer<K, V> createTransactionalProducer(String txIdPrefix) {
 		BlockingQueue<CloseSafeProducer<K, V>> queue = getCache(txIdPrefix);
 		Assert.notNull(queue, () -> "No cache found for " + txIdPrefix);
+		// 是否已经创建producer实例
 		Producer<K, V> cachedProducer = queue.poll();
 		if (cachedProducer == null) {
+			// 创建producer实例
 			return doCreateTxProducer(txIdPrefix, "" + this.transactionIdSuffix.getAndIncrement(), null);
-		}
-		else {
+		} else {
 			return cachedProducer;
 		}
 	}
 
 	private CloseSafeProducer<K, V> doCreateTxProducer(String prefix, String suffix,
 			@Nullable Consumer<CloseSafeProducer<K, V>> remover) {
-
 		Producer<K, V> newProducer;
+		// producuer的配置
 		Map<String, Object> newProducerConfigs = new HashMap<>(this.configs);
 		newProducerConfigs.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, prefix + suffix);
 		if (this.clientIdPrefix != null) {
 			newProducerConfigs.put(ProducerConfig.CLIENT_ID_CONFIG,
 					this.clientIdPrefix + "-" + this.clientIdCounter.incrementAndGet());
 		}
+		// 创建producer实例
 		newProducer = createRawProducer(newProducerConfigs);
+		// 开启producer的事务
 		newProducer.initTransactions();
+		// 使用Spring包装的一层，可友好关闭的producer实例
 		return new CloseSafeProducer<>(newProducer, getCache(prefix), remover,
 				(String) newProducerConfigs.get(ProducerConfig.TRANSACTIONAL_ID_CONFIG));
 	}
 
+	/**
+	 * 创建原始的KafkaProducer实例
+	 * @param configs Kafka producer实例
+	 * @return 原生的KafkaProducer实例
+	 */
 	protected Producer<K, V> createRawProducer(Map<String, Object> configs) {
+		// 直接实例化Kafka底层的API
 		return new KafkaProducer<>(configs, this.keySerializerSupplier.get(), this.valueSerializerSupplier.get());
 	}
 
@@ -546,7 +573,9 @@ public class DefaultKafkaProducerFactory<K, V> implements ProducerFactory<K, V>,
 		private final BlockingQueue<CloseSafeProducer<K, V>> cache;
 
 		private final Consumer<CloseSafeProducer<K, V>> removeConsumerProducer;
-
+		/**
+		 * 事务ID
+		 */
 		private final String txId;
 
 		private volatile Exception txFailed;
